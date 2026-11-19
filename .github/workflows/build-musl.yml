@@ -1,0 +1,40 @@
+name: build-musl
+
+# reason-network 上游 main 的自建 musl 构建（含 #206「reclaim an offline local session's name and
+# waiting mail」，上游 2026-11-06 已合并但尚未发版）。
+# 只用 workflow_dispatch 手动触发，不加 push/定时触发（省 Actions 分钟）。
+on:
+  workflow_dispatch:
+
+env:
+  UPSTREAM_REPO: https://github.com/reason-machines/reason-network
+  UPSTREAM_HEAD: 5442c8b551a6897b596c7695e51b0329551aaa6c
+  RUST_TOOLCHAIN: "1.97.0"   # edition = "2024" 要求 >= 1.85；这里钉一个具体版本而非 stable
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-unknown-linux-musl
+      - name: musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - name: build
+        run: |
+          echo "upstream=$UPSTREAM_REPO@$UPSTREAM_HEAD"
+          git -C . log -1 --format='local HEAD %H %ci %s' || true
+          cargo build --release --locked --target x86_64-unknown-linux-musl
+      - name: package
+        run: |
+          mkdir -p dist
+          tar --owner=0 --group=0 --numeric-owner -czf dist/reason-network-x86_64-unknown-linux-musl.tar.gz \
+            -C target/x86_64-unknown-linux-musl/release reason-network
+          cd dist && sha256sum reason-network-x86_64-unknown-linux-musl.tar.gz > reason-network-x86_64-unknown-linux-musl.tar.gz.sha256
+          ls -l
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reason-network-x86_64-unknown-linux-musl
+          path: dist/*
