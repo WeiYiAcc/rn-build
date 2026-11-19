@@ -15,7 +15,7 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: ${{ env.RUST_TOOLCHAIN }}
@@ -34,7 +34,7 @@ jobs:
             -C target/x86_64-unknown-linux-musl/release reason-network
           cd dist && sha256sum reason-network-x86_64-unknown-linux-musl.tar.gz > reason-network-x86_64-unknown-linux-musl.tar.gz.sha256
           ls -l
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: reason-network-x86_64-unknown-linux-musl
           path: dist/*
