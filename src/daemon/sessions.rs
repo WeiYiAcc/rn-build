@@ -501,12 +501,7 @@ impl Daemon {
             // Gemini's MCP server outlives a conversation (`/clear`): its hooks say when one ends.
             if g.live
                 .get(&key)
-                .is_some_and(|l| {
-                    // pi keeps one MCP server per session, so `conn` is never None for it; its own
-                    // extension does send `session-end` on /new and /resume. Ignoring that signal
-                    // left the ended conversation in the live set for good, blocking every reclaim.
-                    l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity" || agent == "pi"
-                })
+                .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
                 && let Some(l) = g.live.remove(&key)
             {
                 let _ = g.store.touch_session(&l.name, now);

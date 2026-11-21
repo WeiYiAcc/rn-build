@@ -243,7 +243,12 @@ fn executable(p: &Path) -> bool {
 }
 
 pub fn session_from_hooks(agent: &str) -> bool {
-    matches!(agent, "gemini" | "cmd")
+    // An agent whose hooks name the conversation it is in: its own session-end and its process
+    // (past a shell) are the authority on where it is now, so the daemon can end the conversation
+    // it left. pi registers one MCP server per session and reports its session id through
+    // REASON_NETWORK_SESSION, and its hooks carry the agent's pid, so it belongs here rather than
+    // in a per-agent exception.
+    matches!(agent, "gemini" | "cmd" | "pi")
 }
 
 /// The agent process we serve, as [`hook_agent_pid`] finds it for a hook: found once (each step up can run `ps`).
