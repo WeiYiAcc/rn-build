@@ -731,7 +731,12 @@ impl Daemon {
             .live
             .iter()
             .filter(|(_, l)| {
-                l.conn.is_none()
+                // pi keeps one MCP server per session, so after a crash the connection can linger
+                // while the process is already gone; requiring `conn.is_none()` first would keep
+                // that conversation in the live set for good. A known-dead pid is proof enough.
+                // pid unknown: the original rule applies unchanged. pid reused by another process:
+                // pid_alive says alive, so we miss the collection rather than collecting a live one.
+                (l.conn.is_none() || l.reg.pid.is_some_and(|p| !util::pid_alive(p)))
                     && (l.reg.pid.is_some_and(|p| !util::pid_alive(p))
                         || l.last_hook.is_none_or(|t| now - t > HOOK_TTL_MS))
             })
