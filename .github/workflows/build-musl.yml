@@ -38,3 +38,4 @@ jobs:
         with:
           name: reason-network-x86_64-unknown-linux-musl
           path: dist/*
+          retention-days: 7
