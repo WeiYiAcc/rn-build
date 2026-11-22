@@ -531,7 +531,8 @@ mod tests {
     fn gemini_and_command_code_mcp_servers_go_by_their_hooks_session() {
         assert!(session_from_hooks("gemini"));
         assert!(session_from_hooks("cmd"));
-        for a in [CLAUDE_CODE, "codex", "cursor", "opencode", "copilot", "grok", "pi", "zed", ""] {
+        assert!(session_from_hooks("pi"));
+        for a in [CLAUDE_CODE, "codex", "cursor", "opencode", "copilot", "grok", "zed", ""] {
             assert!(!session_from_hooks(a), "{a}");
         }
     }
