@@ -1146,6 +1146,7 @@ mod tests {
                 last_seen: util::now_ms(),
                 attached: true,
                 mailbox: false,
+                ended_at: None,
             };
             d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         }

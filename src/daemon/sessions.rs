@@ -25,6 +25,9 @@ pub(super) const HOOK_TTL: Duration = Duration::from_secs(6 * 3600);
 const HOOK_TTL_MS: i64 = HOOK_TTL.as_millis() as i64;
 /// A session gone this long isn't coming back: it is forgotten, with the mail it never read.
 pub(super) const FORGET_MS: i64 = 24 * 3_600_000;
+/// How long an ended session still holds its name: long enough for the conversation to come back to it after its agent
+/// says it ended (`/clear`, a restart), no longer.
+const ENDED_MS: i64 = 60_000;
 /// A session in a folder that is off counts as mid-turn this long after its last prompt or tool call.
 const OFF_TURN_MS: i64 = 10 * 60_000;
 
@@ -246,9 +249,17 @@ impl Daemon {
     }
 
     /// Whether a session remembered here still keeps its name from every other session: one that can come back to it
-    /// (see [`Remembered::kept`]), until it would be forgotten. The person's own mailboxes are never forgotten.
+    /// (see [`Remembered::kept`]), until it would be forgotten. One whose agent said its conversation ended keeps it
+    /// only a moment more, so the next one in its folder takes the name back. The person's own mailboxes are never
+    /// forgotten.
     pub(super) fn holds(&self, r: &Remembered, now: i64) -> bool {
-        r.kept() && (r.mailbox || now - r.last_seen <= FORGET_MS || !self.forgetting())
+        if r.mailbox {
+            return true;
+        }
+        if r.ended_at.is_some_and(|at| now - at > ENDED_MS) {
+            return false;
+        }
+        r.kept() && (now - r.last_seen <= FORGET_MS || !self.forgetting())
     }
 
     /// Whether sessions gone a day are forgotten yet: not just after a start, while sessions that are still up haven't
@@ -271,11 +282,11 @@ impl Daemon {
     }
 
     /// Ends sessions whose agent is in another conversation now: they are offline from here on, their names kept for
-    /// them. (The log names them by address: agents' session ids stay out of it.)
+    /// them a moment longer. (The log names them by address: agents' session ids stay out of it.)
     pub(super) fn moved_on(&self, g: &mut Inner, keys: Vec<String>, now: i64) {
         for k in keys {
             if let Some(l) = g.live.remove(&k) {
-                let _ = g.store.touch_session(&l.name, now);
+                let _ = g.store.mark_ended(&l.name, now);
                 log(&format!("session {} ended: its agent went on to another conversation", self.addr(&l.name)));
                 self.presence_changed();
             }
@@ -504,7 +515,7 @@ impl Daemon {
                 .is_some_and(|l| l.conn.is_none() || agent::session_from_hooks(agent) || agent == "antigravity")
                 && let Some(l) = g.live.remove(&key)
             {
-                let _ = g.store.touch_session(&l.name, now);
+                let _ = g.store.mark_ended(&l.name, now);
                 log(&format!("session {} ended", self.addr(&l.name)));
                 self.presence_changed();
             }
@@ -802,6 +813,7 @@ fn remembered(l: &Live, now: i64) -> Remembered {
         last_seen: now,
         attached: l.attached,
         mailbox: l.mailbox,
+        ended_at: None,
     }
 }
 
@@ -1073,6 +1085,7 @@ mod tests {
             last_seen: util::now_ms() - 60_000,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         d.inner.lock().unwrap().store.upsert_session(&old, &d.person).unwrap();
 
@@ -1120,6 +1133,85 @@ mod tests {
         let back = d.hook(call("a")).await.unwrap();
         assert_eq!(back.address, Some(d.addr("api-claude")));
         assert!(back.text.is_some_and(|t| t.contains("for api-claude")));
+    }
+
+    /// Its agent said the conversation ended (pi leaves that to its hooks, its MCP server outliving it): after a moment
+    /// the name is the next conversation's in that folder, not a numbered variant of it.
+    #[tokio::test]
+    async fn a_conversation_that_ended_lets_its_name_go() {
+        let d = Arc::new(super::super::test_daemon(Default::default()));
+        let call = |event: &str| HookCall {
+            through_reason: Some(false),
+            agent: "pi".into(),
+            event: event.into(),
+            session_id: "a".into(),
+            cwd: Some("/work/api".into()),
+            pid: None,
+            mail: true,
+            transcript: None,
+            doing: None,
+            name: None,
+            dirs: Vec::new(),
+            keep: false,
+            codex_home: None,
+        };
+        let reg = SessionReg { key: "pi:a".into(), agent: "pi".into(), ..claude("a") };
+        assert_eq!(join(&d, reg).name, "api-pi");
+        d.hook(call("end")).await.unwrap();
+        let now = util::now_ms();
+        let r = d.inner.lock().unwrap().store.session_by_name("api-pi").unwrap().unwrap();
+        // Its own for a moment yet, so a conversation that comes straight back to it gets it.
+        assert!(d.holds(&r, now), "an ended conversation holds its name for a moment");
+        // A minute later it holds nothing: the next conversation in the folder goes by the name itself.
+        let g = d.inner.lock().unwrap();
+        let next = SessionReg { key: "pi:b".into(), agent: "pi".into(), ..claude("b") };
+        let name =
+            pick_name(&g, &next, &GitInfo::default(), &Elsewhere::default(), &d.person, |r| d.holds(r, now + 60_001))
+                .unwrap();
+        assert_eq!(name, "api-pi", "a minute after its end the name is free again");
+    }
+
+    /// A name a live session goes by is still nobody else's: an end is what lets a name go, never a want for it.
+    #[test]
+    fn a_name_a_live_session_goes_by_is_still_refused() {
+        let d = super::super::test_daemon(Default::default());
+        assert_eq!(join(&d, claude("a")).name, "api-claude");
+        assert_eq!(join(&d, claude("b")).name, "api-claude-2");
+        let e = d.set_status("claude-code:b", None, Some("api-claude".into()), Rename::Explicit).unwrap_err();
+        assert!(e.to_string().contains("taken by a live session"), "{e}");
+    }
+
+    /// A row left by a daemon that stopped, or by a conversation that ended, is swept once no live session has it and
+    /// no process answers for it.
+    #[test]
+    fn a_restart_remnant_goes_on_the_next_sweep() {
+        let mut d = super::super::test_daemon(Default::default());
+        settled(&mut d);
+        let row = |name: &str, key: &str, agent: &str| Remembered {
+            name: name.into(),
+            key: key.into(),
+            agent: agent.into(),
+            cwd: "/work/api".into(),
+            repo: None,
+            branch: None,
+            doing: None,
+            tier: Tier::Push,
+            last_seen: util::now_ms() - 2 * DAY,
+            attached: true,
+            mailbox: false,
+            ended_at: None,
+        };
+        {
+            let g = d.inner.lock().unwrap();
+            g.store.upsert_session(&row("api-pi", "pi:a", "pi"), &d.person).unwrap();
+            g.store.upsert_session(&row("api-claude", "claude-code:z", agent::CLAUDE_CODE), &d.person).unwrap();
+            // One that ended, and one an older engine left with no trace of an end: both are remnants now.
+            g.store.mark_ended("api-pi", util::now_ms() - 2 * DAY).unwrap();
+        }
+        let mut g = d.inner.lock().unwrap();
+        d.prune(&mut g);
+        assert!(g.store.session_by_name("api-pi").unwrap().is_none());
+        assert!(g.store.session_by_name("api-claude").unwrap().is_none());
     }
 
     #[tokio::test]
@@ -1424,6 +1516,7 @@ mod tests {
             last_seen: util::now_ms() - 3_600_000,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         {
             let g = d.inner.lock().unwrap();
@@ -1470,6 +1563,7 @@ mod tests {
             last_seen: util::now_ms(),
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         g.store.upsert_session(&r, &d.person).unwrap();
         assert!(g.store.session_by_name("api-claude").unwrap().is_none());
@@ -2379,6 +2473,7 @@ mod tests {
             last_seen: util::now_ms(),
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         d.inner.lock().unwrap().store.upsert_session(&r, &d.person).unwrap();
         assert_eq!(join(&d, claude("old")).name, "api-claude");
@@ -2427,6 +2522,7 @@ mod tests {
                     last_seen: now - 1_000 * (120 - i),
                     attached: true,
                     mailbox: false,
+                    ended_at: None,
                 };
                 g.store.upsert_session(&r, &d.person).unwrap();
             }

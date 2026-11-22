@@ -1823,6 +1823,7 @@ mod tests {
             last_seen: 0,
             attached: true,
             mailbox: agent == "cli",
+            ended_at: None,
         };
         let back = "it reaches that session when it's back, unless another session here explicitly takes its name";
         assert_eq!(

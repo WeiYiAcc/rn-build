@@ -63,6 +63,9 @@ pub struct Remembered {
     pub attached: bool,
     /// One of the person's own mailboxes (`terminal`, a `listen --as` name): kept for good, never forgotten.
     pub mailbox: bool,
+    /// When its agent said the conversation was over (see `mark_ended`): from a moment after, the name is no longer
+    /// held for it, so the next conversation in its folder can take it back instead of a numbered variant.
+    pub ended_at: Option<i64>,
 }
 
 impl Remembered {
@@ -137,7 +140,7 @@ CREATE TABLE IF NOT EXISTS counts (
 
 const MESSAGE_COLS: &str =
     "id, sender, sender_agent, sender_repo, recipient, via, reply_to, body, wake, sent_at, approval, files";
-const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox";
+const SESSION_COLS: &str = "name, key, agent, cwd, repo, branch, doing, tier, last_seen, attached, mailbox, ended_at";
 
 impl Store {
     pub fn record_sent(&self, key: &str, message: &Message, recipient: &str, state: &str) -> Result<()> {
@@ -303,6 +306,9 @@ impl Store {
             ("former", "TEXT"),
             // Its hooks have told it the name it goes by now, in place of `former`.
             ("told_renamed", "INTEGER NOT NULL DEFAULT 0"),
+            // When its agent said its conversation ended (see `mark_ended`). A row written before this was recorded
+            // never ended: NULL, and it holds its name exactly as it did.
+            ("ended_at", "INTEGER"),
         ] {
             if !db.prepare("SELECT 1 FROM pragma_table_info('sessions') WHERE name=?1")?.exists([column])? {
                 db.execute(&format!("ALTER TABLE sessions ADD COLUMN {column} {definition}"), [])?;
@@ -706,11 +712,12 @@ impl Store {
         // Once reachable, a session stays so for as long as it is remembered.
         self.db.execute(
             &format!(
-                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
                  ON CONFLICT (name) DO UPDATE SET key = ?2, agent = ?3, cwd = ?4, repo = ?5, branch = ?6,
                  doing = ?7, tier = ?8, last_seen = ?9,
                  attached = CASE WHEN key = ?2 THEN max(attached, ?10) ELSE ?10 END,
                  mailbox = CASE WHEN key = ?2 THEN max(mailbox, ?11) ELSE ?11 END,
+                 ended_at = NULL,
                  native_app = CASE WHEN key = ?2 THEN native_app ELSE 0 END,
                  native_hook_at = CASE WHEN key = ?2 THEN native_hook_at ELSE NULL END,
                  native_dirs = CASE WHEN key = ?2 THEN native_dirs ELSE '[]' END,
@@ -729,7 +736,8 @@ impl Store {
                 s.tier.as_str(),
                 s.last_seen,
                 s.attached,
-                s.mailbox
+                s.mailbox,
+                s.ended_at
             ],
         )?;
         Ok(())
@@ -737,6 +745,17 @@ impl Store {
 
     pub fn touch_session(&self, name: &str, now: i64) -> Result<()> {
         self.db.execute("UPDATE sessions SET last_seen = ?2 WHERE name = ?1", params![name, now])?;
+        Ok(())
+    }
+
+    /// Its agent said the conversation is over: it is seen as of `now`, and keeps the moment it ended, the first one
+    /// said. From a moment after that, the name is no longer held for it, so the next session in its folder takes it
+    /// back by name. A row registered again clears this (see `upsert_session`).
+    pub fn mark_ended(&self, name: &str, now: i64) -> Result<()> {
+        self.db.execute(
+            "UPDATE sessions SET last_seen = ?2, ended_at = coalesce(ended_at, ?2) WHERE name = ?1",
+            params![name, now],
+        )?;
         Ok(())
     }
 
@@ -931,6 +950,7 @@ fn remembered(r: &Row) -> rusqlite::Result<Remembered> {
         last_seen: r.get(8)?,
         attached: r.get(9)?,
         mailbox: r.get(10)?,
+        ended_at: r.get(11)?,
     })
 }
 
@@ -958,6 +978,7 @@ mod tests {
                         tier: Tier::Pull,
                         last_seen: 0,
                         attached: name == "new",
+                        ended_at: None,
                         mailbox: false,
                     },
                     "lars",
@@ -1018,6 +1039,7 @@ mod tests {
             last_seen: 0,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         // A database from an engine before titles named sessions: whether `api-claude-3` was chosen, nothing says.
         {
@@ -1056,6 +1078,7 @@ mod tests {
             last_seen: 0,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         store.upsert_session(&r("old"), "lars").unwrap();
         store.insert(&mut message("pending", "lars/old"), false).unwrap();
@@ -1214,6 +1237,7 @@ mod tests {
             last_seen: 1,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         store.upsert_session(&session("codex:t1"), "lars").unwrap();
         assert_eq!(store.codex_home("codex:t1").unwrap(), None);
@@ -1241,6 +1265,7 @@ mod tests {
             tier: Tier::Push,
             last_seen,
             attached: true,
+            ended_at: None,
         };
         for s in [
             session("gone", "claude-code", 0),
@@ -1296,6 +1321,7 @@ mod tests {
             last_seen,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         // As older engines could: the same session under two names, mail waiting under each.
         for (name, seen) in [("api-claude", 1), ("api-claude-2", 2)] {
@@ -1304,7 +1330,7 @@ mod tests {
                 .db
                 .execute(
                     &format!(
-                        "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, 1, 0)"
+                        "INSERT INTO sessions ({SESSION_COLS}) VALUES (?1, ?2, ?3, ?4, NULL, NULL, NULL, ?5, ?6, 1, 0, NULL)"
                     ),
                     params![s.name, s.key, s.agent, s.cwd, s.tier.as_str(), s.last_seen],
                 )
@@ -1416,6 +1442,7 @@ mod tests {
             last_seen: now - 2 * 86_400_000,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         store.upsert_session(&recipient, "sven").unwrap();
         store.forget_session(&recipient, "sven").unwrap();
@@ -1650,6 +1677,7 @@ mod tests {
             last_seen: 0,
             attached: true,
             mailbox: false,
+            ended_at: None,
         };
         store.upsert_session(&session("gone"), "lars").unwrap();
         store.upsert_session(&session("api"), "lars").unwrap();
